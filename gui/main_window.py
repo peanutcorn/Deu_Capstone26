@@ -120,12 +120,27 @@ class MainWindow(QMainWindow):
         self.btn_webcam.setFixedHeight(34)
         self.btn_webcam.clicked.connect(self._on_webcam)
 
+        # IP 카메라 RTSP
+        lbl_rtsp = QLabel("IP 카메라 (RTSP)")
+        lbl_rtsp.setStyleSheet("color: #aaaacc; font-size: 11px; margin-top: 4px;")
+        rtsp_row = QHBoxLayout()
+        self.edit_rtsp = QLineEdit()
+        self.edit_rtsp.setPlaceholderText("rtsp://user:pass@ip:port/path")
+        self.btn_rtsp = QPushButton("연결")
+        self.btn_rtsp.setFixedWidth(46)
+        self.btn_rtsp.setFixedHeight(28)
+        self.btn_rtsp.clicked.connect(self._on_rtsp)
+        rtsp_row.addWidget(self.edit_rtsp)
+        rtsp_row.addWidget(self.btn_rtsp)
+
         self.lbl_source = QLabel("소스: (없음)")
         self.lbl_source.setWordWrap(True)
         self.lbl_source.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
         layout.addWidget(self.btn_open_file)
         layout.addWidget(self.btn_webcam)
+        layout.addWidget(lbl_rtsp)
+        layout.addLayout(rtsp_row)
         layout.addWidget(self.lbl_source)
         return grp
 
@@ -245,6 +260,18 @@ class MainWindow(QMainWindow):
         self._stop_thread()
         self.lbl_source.setText("소스: 웹캠 (0)")
         self._start_thread(0)
+
+    def _on_rtsp(self):
+        url = self.edit_rtsp.text().strip()
+        if not url:
+            QMessageBox.warning(self, "URL 없음", "RTSP URL을 입력하세요.")
+            return
+        if not url.startswith(("rtsp://", "rtmp://", "http://", "https://")):
+            QMessageBox.warning(self, "URL 형식 오류", "rtsp:// 로 시작하는 URL을 입력하세요.")
+            return
+        self._stop_thread()
+        self.lbl_source.setText(f"IP 카메라: {url}")
+        self._start_thread(url)
 
     def _on_play_pause(self):
         if self._thread is None:

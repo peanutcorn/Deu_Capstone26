@@ -81,20 +81,43 @@ class VideoThread(QThread):
         self.show_track_id = True
         self.show_keypoints = True
 
+    @property
+    def _is_live(self) -> bool:
+        """RTSP/웹캠처럼 끊기면 재연결이 필요한 라이브 소스인지 여부."""
+        if isinstance(self.source, int):
+            return True
+        s = str(self.source).lower()
+        return s.startswith(("rtsp://", "rtmp://"))
+
+    def _open_capture(self):
+        """소스에 맞는 VideoCapture를 열고 반환한다."""
+        if self._is_live and not isinstance(self.source, int):
+            # RTSP: FFmpeg 백엔드 우선 사용, 버퍼 최소화로 지연 감소
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            cap = cv2.VideoCapture(self.source)
+        return cap
+
     def run(self):
         self._running = True
         cap = None
         try:
             detector = HumanDetector(self.model_path, self.conf)
             tracker = HumanTracker(self.max_age)
-            cap = cv2.VideoCapture(self.source)
+            cap = self._open_capture()
             if not cap.isOpened():
                 self.error_occurred.emit(f"영상 소스를 열 수 없습니다: {self.source}")
                 return
 
             src_fps = cap.get(cv2.CAP_PROP_FPS)
             # 30 fps 상한: 처리 속도가 원본 fps를 초과하면 Qt 이벤트 큐가 과부하됨
+            # RTSP는 fps가 0으로 반환될 수 있으므로 30fps로 고정
             target_interval = 1.0 / min(src_fps if src_fps > 0 else 30.0, 30.0)
+
+            _reconnect_delay = 2.0   # RTSP 끊김 후 재연결 대기 (초)
+            _max_reconnects = 5      # 최대 재연결 시도 횟수
+            _reconnect_count = 0
 
             prev_time = time.time()
             while self._running:
@@ -104,8 +127,27 @@ class VideoThread(QThread):
 
                 loop_start = time.time()
                 ret, frame = cap.read()
+
                 if not ret:
-                    break
+                    if not self._is_live:
+                        break  # 파일 재생 종료
+
+                    # RTSP 끊김 — 재연결 시도
+                    _reconnect_count += 1
+                    if _reconnect_count > _max_reconnects:
+                        self.error_occurred.emit(
+                            f"RTSP 스트림 재연결 실패 ({_max_reconnects}회 시도): {self.source}"
+                        )
+                        break
+                    cap.release()
+                    time.sleep(_reconnect_delay)
+                    cap = self._open_capture()
+                    if not cap.isOpened():
+                        continue
+                    _reconnect_count = 0
+                    continue
+
+                _reconnect_count = 0  # 정상 수신이면 카운터 초기화
 
                 detector.set_confidence(self.conf)
                 detections = detector.detect(frame)

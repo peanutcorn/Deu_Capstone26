@@ -1,6 +1,9 @@
 import time
+import os
 import cv2
 import numpy as np
+import requests
+from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
@@ -26,6 +29,11 @@ _SKELETON = [
     (11, 13), (13, 15),                  # 왼쪽 다리
     (12, 14), (14, 16),                  # 오른쪽 다리
 ]
+
+_API_URL = "http://127.0.0.1:8000/api/alert"
+_ALERT_COOLDOWN_SEC = 10
+_EVENT_IMAGE_DIR = "event_captures"
+
 
 _KPT_CONF_THRESHOLD = 0.3
 
@@ -80,7 +88,12 @@ class VideoThread(QThread):
         self.show_bbox = True
         self.show_track_id = True
         self.show_keypoints = True
-
+        
+        # [추가된 부분] API 연동 쿨타임을 위한 타이머 초기화
+        self.last_alert_time = 0 
+        
+        # 이벤트 이미지 저장 디렉토리 생성
+        os.makedirs(_EVENT_IMAGE_DIR, exist_ok=True)
     @property
     def _is_live(self) -> bool:
         """RTSP/웹캠처럼 끊기면 재연결이 필요한 라이브 소스인지 여부."""
@@ -158,6 +171,34 @@ class VideoThread(QThread):
                     kpt_map = _match_keypoints(tracks, detections)
 
                 self._draw(frame, tracks, kpt_map)
+
+                # [추가된 부분] 가상 이상행동 감지 및 FastAPI 연동 테스트
+                # 화면에 추적된 사람(tracks)이 1명 이상이고, 마지막 알림 이후 10초가 지났다면 실행
+                current_time = time.time()
+                if len(tracks) > 0 and (current_time - self.last_alert_time > _ALERT_COOLDOWN_SEC):
+                    self.last_alert_time = current_time # 쿨타임 초기화
+                    
+                    # 1) 사진 저장하기
+                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    img_name = f"evt_{timestamp_str}.jpg"
+                    img_path = os.path.join(_EVENT_IMAGE_DIR, img_name)
+                    cv2.imwrite(img_path, frame) # 현재 프레임을 사진으로 저장
+                    
+                    # 2) JSON 데이터 만들기 (회의때 설계한 구조 맞춰서) ai 모델 나오면 여기 수정 해야함
+                    payload = {
+                        "event_id": f"evt_{timestamp_str}",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "anomaly_type": "폭행(테스트)", 
+                        "image_path": os.path.abspath(img_path)
+                    }
+                    
+                    # 3) FastAPI 서버로 POST 전송
+                    try:
+                        # timeout=2를 설정하여 서버가 꺼져있어도 프로그램이 오래 멈추지 않게 방지
+                        response = requests.post(_API_URL, json=payload, timeout=2)
+                        print(f"✅ FastAPI 전송 성공! (상태코드: {response.status_code})")
+                    except requests.exceptions.RequestException as e:
+                        print(f"❌ FastAPI 전송 실패 (서버가 켜져있는지 확인하세요): {e}")
 
                 now = time.time()
                 fps = 1.0 / max(now - prev_time, 1e-6)

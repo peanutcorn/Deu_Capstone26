@@ -32,3 +32,9 @@ Desktop.ini
 .DS_Store
 .claudeignore
 process.md
+# Secrets and Tokens
+kakao_tokens.json
+
+# Output Data
+event_captures/
+output_videos/

@@ -44,6 +44,8 @@ proto-cctv/
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
+pip install fastapi uvicorn pydantic
+pip install pyngrok
 ```
 
 > CUDA GPU 환경이라면 PyTorch를 먼저 별도 설치하세요.  
@@ -51,12 +53,29 @@ pip install -r requirements.txt
 
 ### 2. 실행
 
+Fast api 실행
+
+```
+uvicorn core.api_server:app --reload
+```
+ngrok 실행
+
+```
+ngrok http 8000
+
+```
+본 프로젝트 실행
+
 ```powershell
 .\.venv\Scripts\python.exe main.py
 ```
 
 또는 `run.bat` 더블클릭.
 
+mac os 는 
+```
+python main.py
+```
 ## 사용 방법
 
 1. **영상 소스 선택** — `파일 열기` 또는 `웹캠 시작`

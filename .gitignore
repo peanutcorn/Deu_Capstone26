@@ -14,7 +14,14 @@ __pycache__/
 # ultralytics 실행 결과
 runs/
 
+# 키포인트 추출 결과 (재생성 가능, 용량 큼)
+*.npz
+
+# 학습 체크포인트 / 로그
+train/*/output/
+
 # 영상 파일
+train/*/split/data
 *.mp4
 *.avi
 *.mkv

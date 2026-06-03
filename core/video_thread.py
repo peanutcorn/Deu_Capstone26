@@ -6,6 +6,7 @@ from PyQt5.QtGui import QImage
 
 from core.detector import HumanDetector
 from core.tracker import HumanTracker
+from core.labels import label_en
 
 _COLOR_PALETTE = [
     (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
@@ -63,23 +64,52 @@ def _match_keypoints(tracks: list, detections: list) -> dict:
     return result
 
 
+def _summarize_behavior(behavior_map: dict) -> tuple:
+    """인물별 행동 결과를 화면 전체 요약 (class_id, conf) 로 압축한다.
+
+    - 결과 없음            → (-1, 0.0)  분석 중
+    - 이상행동 있음        → 신뢰도가 가장 높은 이상행동 (class_id != 0)
+    - 전원 정상            → (0, 최대 정상 신뢰도)
+    """
+    if not behavior_map:
+        return -1, 0.0
+    best_abn = None       # (conf, class_id)
+    best_normal_conf = 0.0
+    for cid, conf in behavior_map.values():
+        if cid != 0:
+            if best_abn is None or conf > best_abn[0]:
+                best_abn = (conf, cid)
+        else:
+            best_normal_conf = max(best_normal_conf, conf)
+    if best_abn is not None:
+        return best_abn[1], best_abn[0]
+    return 0, best_normal_conf
+
+
 class VideoThread(QThread):
     frame_ready = pyqtSignal(QImage)
-    stats_updated = pyqtSignal(int, float)
+    stats_updated = pyqtSignal(int, float)        # (감지 인원, fps)
+    # 화면 전체에서 가장 두드러진 이상행동 요약: (class_id, confidence)
+    #   class_id = -1 분석 중 / 0 정상 / 그 외 이상행동
+    behavior_ready = pyqtSignal(int, float)
     error_occurred = pyqtSignal(str)
     finished_signal = pyqtSignal()
 
-    def __init__(self, source, model_path: str, conf: float, max_age: int):
+    def __init__(self, source, model_path: str, conf: float, max_age: int,
+                 kpt_model_path: str = "", imgsz: int = 640):
         super().__init__()
         self.source = source
-        self.model_path = model_path
+        self.model_path = model_path  # 항상 YOLO pose 모델
         self.conf = conf
         self.max_age = max_age
+        self.kpt_model_path = kpt_model_path  # 키포인트 행동 분류 모델 경로 (선택)
+        self.imgsz = imgsz                    # 추론 해상도 (경량화)
         self._running = False
         self._paused = False
         self.show_bbox = True
         self.show_track_id = True
         self.show_keypoints = True
+        self.show_kpt_behavior = True  # 키포인트 행동 분류 결과 표시 여부
 
     @property
     def _is_live(self) -> bool:
@@ -103,8 +133,13 @@ class VideoThread(QThread):
         self._running = True
         cap = None
         try:
-            detector = HumanDetector(self.model_path, self.conf)
+            detector = HumanDetector(self.model_path, self.conf, imgsz=self.imgsz)
             tracker = HumanTracker(self.max_age)
+            # 키포인트 행동 분류: YOLO pose 모델 + 별도 .pth 지정 시 활성
+            kpt_buf = None
+            if self.kpt_model_path and detector.is_pose:
+                from core.kpt_behavior_classifier import TrackBehaviorBuffer
+                kpt_buf = TrackBehaviorBuffer(self.kpt_model_path)
             cap = self._open_capture()
             if not cap.isOpened():
                 self.error_occurred.emit(f"영상 소스를 열 수 없습니다: {self.source}")
@@ -149,21 +184,30 @@ class VideoThread(QThread):
 
                 _reconnect_count = 0  # 정상 수신이면 카운터 초기화
 
+                now = time.time()
+                fps = 1.0 / max(now - prev_time, 1e-6)
+                prev_time = now
+
                 detector.set_confidence(self.conf)
                 detections = detector.detect(frame)
                 tracks = tracker.update(detections, frame)
 
                 kpt_map = {}
-                if self.show_keypoints and detector.is_pose:
+                if detector.is_pose:
                     kpt_map = _match_keypoints(tracks, detections)
 
-                self._draw(frame, tracks, kpt_map)
+                # 키포인트 행동 분류 (pose 모델 + kpt_model 지정 시)
+                behavior_map = {}
+                if kpt_buf is not None and self.show_kpt_behavior:
+                    behavior_map = kpt_buf.update(tracks, kpt_map)
 
-                now = time.time()
-                fps = 1.0 / max(now - prev_time, 1e-6)
-                prev_time = now
-
+                self._draw(frame, tracks,
+                           kpt_map if self.show_keypoints else {},
+                           behavior_map)
                 self.stats_updated.emit(len(tracks), fps)
+                cid, bconf = _summarize_behavior(behavior_map)
+                self.behavior_ready.emit(cid, bconf)
+
                 self.frame_ready.emit(self._to_qimage(frame))
 
                 elapsed = time.time() - loop_start
@@ -179,20 +223,37 @@ class VideoThread(QThread):
             self.finished_signal.emit()
 
     # ------------------------------------------------------------------ 그리기
-    def _draw(self, frame: np.ndarray, tracks: list, kpt_map: dict):
+    def _draw(self, frame: np.ndarray, tracks: list, kpt_map: dict,
+              behavior_map: dict = None):
+        if behavior_map is None:
+            behavior_map = {}
         for t in tracks:
             tid = t["track_id"]
             color = _track_color(tid)
             x1, y1, x2, y2 = t["bbox"]
 
+            # 이상행동 감지 시 빨간 테두리 색상으로 덮어씀
+            beh = behavior_map.get(tid)
+            if beh is not None and beh[0] != 0:
+                color = (0, 0, 255)   # BGR 빨강
+
             if self.show_bbox:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # 레이블 조합: "ID:1 | FALL 92%"
+                parts = []
                 if self.show_track_id:
-                    label = f"ID:{tid}"
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    parts.append(f"ID:{tid}")
+                if beh is not None:
+                    cid, bconf = beh
+                    parts.append(f"{label_en(cid)} {bconf*100:.0f}%")
+
+                if parts:
+                    label = " | ".join(parts)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
                     cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                     cv2.putText(frame, label, (x1 + 2, y1 - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
             kpts = kpt_map.get(tid)
             if kpts is not None:

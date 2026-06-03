@@ -1,0 +1,36 @@
+0. test 정리 
+=> test : 61180 samples (약 영상의 20%)
+=> 최종 성능 : 93.940 (PCKh@0.5 값) (제안서 목표 : 80) 
+(Mean : PCKh@0.5, Mean@0.1 : PCKh@0.1)
+
+1. NIA 이상행동 데이터셋 경로 확인
+
+2. experiments/nia/UP_resnet50_nia.yaml 파일 수정
+	-> DATASET.ROOT = ${NIA 이상행동 데이터셋 경로}		
+	-> GPUS = (0, )						# 검증하는 pc에서 gpu 1개 일 때는 (0, ),  2개일 때는 (0, 1), 4개일 때는 (0, 1, 2, 3)으로 수정
+
+3. unipose 폴더 위치에서 아래 명령어 입력
+	python tools/test_nia.py --cfg experiments/nia/UP_resnet50_nia.yaml
+
+
+4. print 결과 확인 (아래와 같은 결과 확인)
+
+...
+=====> success to load resnet50
+=> loading model from weight/final_state.pth
+=> load 61180 samples
+Test: [0/3824]  Time 40.672 (40.672)    Loss 0.0004 (0.0004)    Accuracy 0.900 (0.900)
+Test: [10/3824] Time 0.225 (8.709)      Loss 0.0006 (0.0007)    Accuracy 0.844 (0.830)
+Test: [20/3824] Time 0.535 (6.894)      Loss 0.0005 (0.0008)    Accuracy 0.856 (0.821)
+Test: [30/3824] Time 0.245 (6.269)      Loss 0.0008 (0.0008)    Accuracy 0.814 (0.812)
+Test: [40/3824] Time 35.819 (6.982)     Loss 0.0006 (0.0009)    Accuracy 0.810 (0.797)
+Test: [50/3824] Time 0.219 (6.798)      Loss 0.0014 (0.0008)    Accuracy 0.605 (0.801)
+Test: [60/3824] Time 0.221 (6.431)      Loss 0.0005 (0.0008)    Accuracy 0.866 (0.807)
+Test: [70/3824] Time 0.282 (6.265)      Loss 0.0005 (0.0008)    Accuracy 0.890 (0.816)
+Test: [80/3824] Time 33.539 (6.462)     Loss 0.0004 (0.0008)    Accuracy 0.913 (0.822)
+Test: [90/3824] Time 0.218 (6.536)      Loss 0.0014 (0.0007)    Accuracy 0.757 (0.826)
+Test: [100/3824]        Time 0.260 (6.334)      Loss 0.0003 (0.0007)    Accuracy 0.959 (0.829)
+...
+| Arch | Head | Shoulder | Elbow | Wrist | Hip | Knee | Ankle | Mean | Mean@0.1 |
+|---|---|---|---|---|---|---|---|---|---|
+| unipose | 99.070 | 95.487 | 92.000 | 91.650 | 94.519 | 87.314 | 95.369 | 93.940 | 46.983 |

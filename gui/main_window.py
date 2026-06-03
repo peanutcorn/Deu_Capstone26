@@ -3,12 +3,19 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QSlider,
     QFileDialog, QHBoxLayout, QVBoxLayout, QGroupBox,
     QSizePolicy, QStatusBar, QComboBox, QCheckBox, QSpinBox,
-    QMessageBox, QFrame, QRadioButton, QButtonGroup, QLineEdit
+    QMessageBox, QFrame, QLineEdit
 )
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QPixmap, QFont, QIcon
 
 from core.video_thread import VideoThread
+
+
+def _default_kpt_behavior_model_path() -> str:
+    """학습 후 생성되는 키포인트 행동 분류 모델 기본 경로."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "train", "1_behavior", "output", "kpt_behavior.pth")
+    return path if os.path.isfile(path) else ""
 
 
 class VideoDisplay(QLabel):
@@ -145,47 +152,49 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_model_group(self) -> QGroupBox:
-        grp = QGroupBox("모델 설정")
+        grp = QGroupBox("모델 설정 (이상행동 감지)")
         layout = QVBoxLayout(grp)
 
-        # --- 모델 유형 선택 ---
-        self._model_type_grp = QButtonGroup(self)
-        self.radio_yolo = QRadioButton("YOLO 사전학습 모델")
-        self.radio_custom = QRadioButton("커스텀 학습 모델 (.pt)")
-        self.radio_yolo.setChecked(True)
-        self._model_type_grp.addButton(self.radio_yolo, 0)
-        self._model_type_grp.addButton(self.radio_custom, 1)
-        self.radio_yolo.toggled.connect(self._on_model_type_toggled)
-        layout.addWidget(self.radio_yolo)
-        layout.addWidget(self.radio_custom)
-
-        # YOLO 사전학습 콤보 (일반 + 포즈)
+        # 감지 모델 — YOLO pose (인물 감지 + 17관절). 작은 모델일수록 경량 PC 친화적.
+        lbl_det = QLabel("감지 모델 (포즈)")
+        lbl_det.setStyleSheet("color: #aaaacc; font-size: 11px;")
+        layout.addWidget(lbl_det)
         self.combo_model = QComboBox()
         self.combo_model.addItems([
-            "── 일반 감지 ──",
-            "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
-            "── 포즈 감지 ──",
-            "yolo11n-pose.pt", "yolo11s-pose.pt", "yolo11m-pose.pt",
+            "yolo11n-pose.pt  (경량·권장)",
+            "yolo11s-pose.pt  (균형)",
+            "yolo11m-pose.pt  (정확)",
         ])
-        # 구분선 항목 비활성화
-        for i in (0, 6):
-            self.combo_model.model().item(i).setEnabled(False)
-        self.combo_model.setCurrentIndex(1)
-        self.combo_model.currentIndexChanged.connect(self._on_model_changed)
+        self.combo_model.setCurrentIndex(0)
         layout.addWidget(self.combo_model)
 
-        # 커스텀 모델 파일 선택
-        custom_row = QHBoxLayout()
-        self.edit_custom_model = QLineEdit()
-        self.edit_custom_model.setPlaceholderText("best.pt 경로...")
-        self.edit_custom_model.setEnabled(False)
-        self.btn_browse_model = QPushButton("찾기")
-        self.btn_browse_model.setFixedWidth(46)
-        self.btn_browse_model.setEnabled(False)
-        self.btn_browse_model.clicked.connect(self._on_browse_model)
-        custom_row.addWidget(self.edit_custom_model)
-        custom_row.addWidget(self.btn_browse_model)
-        layout.addLayout(custom_row)
+        # 이상행동 분류 모델 (KeypointLSTM, kpt_behavior.pth)
+        lbl_kpt_beh = QLabel("이상행동 분류 모델 (kpt_behavior.pth)")
+        lbl_kpt_beh.setStyleSheet("color: #aaaacc; font-size: 11px; margin-top: 2px;")
+        layout.addWidget(lbl_kpt_beh)
+        kpt_beh_row = QHBoxLayout()
+        self.edit_kpt_behavior_model = QLineEdit()
+        self.edit_kpt_behavior_model.setPlaceholderText("kpt_behavior.pth 경로...")
+        self.edit_kpt_behavior_model.setText(_default_kpt_behavior_model_path())
+        self.btn_browse_kpt_behavior = QPushButton("찾기")
+        self.btn_browse_kpt_behavior.setFixedWidth(46)
+        self.btn_browse_kpt_behavior.clicked.connect(self._on_browse_kpt_behavior)
+        kpt_beh_row.addWidget(self.edit_kpt_behavior_model)
+        kpt_beh_row.addWidget(self.btn_browse_kpt_behavior)
+        layout.addLayout(kpt_beh_row)
+
+        # 처리 해상도 — 작을수록 빠름 (경량 PC 최적화)
+        lbl_imgsz = QLabel("처리 해상도 (경량화)")
+        lbl_imgsz.setStyleSheet("color: #aaaacc; font-size: 11px; margin-top: 2px;")
+        layout.addWidget(lbl_imgsz)
+        self.combo_imgsz = QComboBox()
+        self.combo_imgsz.addItems([
+            "384  (가장 빠름)",
+            "480  (빠름·권장)",
+            "640  (정확)",
+        ])
+        self.combo_imgsz.setCurrentIndex(1)  # 480 기본
+        layout.addWidget(self.combo_imgsz)
 
         # 구분선
         line = QFrame()
@@ -224,9 +233,12 @@ class MainWindow(QMainWindow):
         self.chk_track_id.setChecked(True)
         self.chk_keypoints = QCheckBox("관절 키포인트 (포즈 모델)")
         self.chk_keypoints.setChecked(True)
+        self.chk_kpt_behavior = QCheckBox("키포인트 행동 분류")
+        self.chk_kpt_behavior.setChecked(True)
         layout.addWidget(self.chk_bbox)
         layout.addWidget(self.chk_track_id)
         layout.addWidget(self.chk_keypoints)
+        layout.addWidget(self.chk_kpt_behavior)
         return grp
 
     def _build_stats_group(self) -> QGroupBox:
@@ -237,11 +249,16 @@ class MainWindow(QMainWindow):
         self.lbl_count.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
         self.lbl_count.setStyleSheet("color: #00d4aa;")
 
+        self.lbl_behavior = QLabel("이상행동: —")
+        self.lbl_behavior.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
+        self.lbl_behavior.setStyleSheet("color: #00d4aa;")
+
         self.lbl_fps = QLabel("FPS: —")
         self.lbl_fps.setFont(QFont("Malgun Gothic", 11))
         self.lbl_fps.setStyleSheet("color: #aaaaaa;")
 
         layout.addWidget(self.lbl_count)
+        layout.addWidget(self.lbl_behavior)
         layout.addWidget(self.lbl_fps)
         return grp
 
@@ -288,30 +305,18 @@ class MainWindow(QMainWindow):
         self.video_display.setText("영상을 불러오세요")
         self.video_display._pixmap = None
         self.lbl_count.setText("감지된 인원: 0명")
+        self.lbl_behavior.setText("이상행동: —")
+        self.lbl_behavior.setStyleSheet("color: #00d4aa;")
         self.lbl_fps.setText("FPS: —")
         self.status_bar.showMessage("정지됨.")
 
-    def _on_model_type_toggled(self, yolo_selected: bool):
-        self.combo_model.setEnabled(yolo_selected)
-        self.edit_custom_model.setEnabled(not yolo_selected)
-        self.btn_browse_model.setEnabled(not yolo_selected)
-
-    def _on_model_changed(self, index: int):
-        text = self.combo_model.itemText(index)
-        is_pose = "pose" in text
-        self.chk_keypoints.setEnabled(is_pose)
-        if not is_pose:
-            self.chk_keypoints.setChecked(False)
-        else:
-            self.chk_keypoints.setChecked(True)
-
-    def _on_browse_model(self):
+    def _on_browse_kpt_behavior(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "학습 모델 파일 선택", "",
-            "PyTorch 모델 (*.pt *.pth);;모든 파일 (*)"
+            self, "키포인트 행동 분류 모델 선택", "",
+            "PyTorch 모델 (*.pth);;모든 파일 (*)"
         )
         if path:
-            self.edit_custom_model.setText(path)
+            self.edit_kpt_behavior_model.setText(path)
 
     def _on_conf_changed(self, value: int):
         conf = value / 100.0
@@ -327,6 +332,18 @@ class MainWindow(QMainWindow):
         self.lbl_count.setText(f"감지된 인원: {count}명")
         self.lbl_fps.setText(f"FPS: {fps:.1f}")
 
+    def _on_behavior(self, class_id: int, conf: float):
+        from core.labels import label_kr
+        if class_id < 0:
+            self.lbl_behavior.setText("이상행동: 분석 중...")
+            self.lbl_behavior.setStyleSheet("color: #aaaaaa;")
+            return
+        name = label_kr(class_id)
+        self.lbl_behavior.setText(f"이상행동: {name} ({conf * 100:.0f}%)")
+        # 정상=초록, 그 외=빨강 강조
+        color = "#00d4aa" if class_id == 0 else "#ff4d4d"
+        self.lbl_behavior.setStyleSheet(f"color: {color};")
+
     def _on_error(self, msg: str):
         QMessageBox.critical(self, "오류", msg)
         self._stop_thread()
@@ -338,31 +355,35 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("재생 완료.")
 
     # ------------------------------------------------------------------ 스레드
-    def _resolve_model_path(self) -> str | None:
-        if self.radio_yolo.isChecked():
-            return self.combo_model.currentText()
-        path = self.edit_custom_model.text().strip()
-        if not path:
-            QMessageBox.warning(self, "모델 미선택", "커스텀 모델 파일 경로를 입력하세요.")
-            return None
-        if not os.path.isfile(path):
-            QMessageBox.warning(self, "파일 없음", f"파일을 찾을 수 없습니다:\n{path}")
-            return None
-        return path
+    def _resolve_model_path(self) -> str:
+        # 콤보 항목은 "yolo11n-pose.pt  (경량·권장)" 형태 → 첫 토큰이 실제 파일명
+        return self.combo_model.currentText().split()[0]
+
+    def _resolve_imgsz(self) -> int:
+        return int(self.combo_imgsz.currentText().split()[0])
 
     def _start_thread(self, source):
         model = self._resolve_model_path()
-        if model is None:
-            return
         conf = self.slider_conf.value() / 100.0
         max_age = self.spin_max_age.value()
+        imgsz = self._resolve_imgsz()
 
-        self._thread = VideoThread(source, model, conf, max_age)
+        # 키포인트 행동 분류 모델 경로 (파일이 존재할 때만 전달)
+        kpt_model = self.edit_kpt_behavior_model.text().strip()
+        if not (kpt_model and os.path.isfile(kpt_model)):
+            kpt_model = ""
+            self.status_bar.showMessage(
+                "이상행동 모델(kpt_behavior.pth) 미지정 — 감지·추적만 동작합니다.")
+
+        self._thread = VideoThread(source, model, conf, max_age,
+                                   kpt_model_path=kpt_model, imgsz=imgsz)
         self._thread.show_bbox = self.chk_bbox.isChecked()
         self._thread.show_track_id = self.chk_track_id.isChecked()
         self._thread.show_keypoints = self.chk_keypoints.isChecked()
+        self._thread.show_kpt_behavior = self.chk_kpt_behavior.isChecked()
         self._thread.frame_ready.connect(self._on_frame)
         self._thread.stats_updated.connect(self._on_stats)
+        self._thread.behavior_ready.connect(self._on_behavior)
         self._thread.error_occurred.connect(self._on_error)
         self._thread.finished_signal.connect(self._on_thread_finished)
 
@@ -376,6 +397,9 @@ class MainWindow(QMainWindow):
         )
         self.chk_keypoints.stateChanged.connect(
             lambda s: setattr(self._thread, 'show_keypoints', bool(s))
+        )
+        self.chk_kpt_behavior.stateChanged.connect(
+            lambda s: setattr(self._thread, 'show_kpt_behavior', bool(s))
         )
 
         self._thread.start()

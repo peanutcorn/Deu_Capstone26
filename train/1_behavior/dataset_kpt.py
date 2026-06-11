@@ -29,6 +29,9 @@ class KptBehaviorDataset(Dataset):
         seq = self.sequences[idx].copy()  # (T, 34)
 
         if self.augment:
+            # 미검출 관절(0,0)은 모든 변환 후에도 0으로 유지해야 한다
+            nz = (seq != 0).astype(np.float32)
+
             # 좌우 반전: 홀수 인덱스(x) 를 1에서 뺌, 짝수(y) 는 그대로
             if np.random.rand() < 0.5:
                 seq[:, 0::2] = 1.0 - seq[:, 0::2]
@@ -39,10 +42,27 @@ class KptBehaviorDataset(Dataset):
                 for l, r in _FLIP_PAIRS:
                     li, ri = l*2, r*2
                     seq[:, [li, li+1, ri, ri+1]] = seq[:, [ri, ri+1, li, li+1]]
+                nz = (seq != 0).astype(np.float32)
+
+            # 공간 jitter: bbox 추정 오차 시뮬레이션 (스케일 ±10%, 이동 ±5%)
+            if np.random.rand() < 0.5:
+                scale = np.random.uniform(0.9, 1.1)
+                shift = np.random.uniform(-0.05, 0.05, size=2).astype(np.float32)
+                seq[:, 0::2] = (seq[:, 0::2] - 0.5) * scale + 0.5 + shift[0]
+                seq[:, 1::2] = (seq[:, 1::2] - 0.5) * scale + 0.5 + shift[1]
+                seq *= nz  # 미검출 관절 복원
+
+            # 시간 증강: 일부 프레임을 직전 프레임으로 치환 (검출 끊김·프레임 드랍 시뮬레이션)
+            if np.random.rand() < 0.3:
+                drop = np.random.rand(seq.shape[0]) < 0.15
+                for t in range(1, seq.shape[0]):
+                    if drop[t]:
+                        seq[t] = seq[t - 1]
+                nz = (seq != 0).astype(np.float32)
 
             # 가우시안 노이즈
             noise = np.random.randn(*seq.shape).astype(np.float32) * 0.01
-            seq = np.clip(seq + noise, 0.0, 1.0)
+            seq = np.clip(seq + noise * nz, 0.0, 1.0)
 
         return torch.from_numpy(seq), int(self.labels[idx])
 

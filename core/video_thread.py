@@ -1,6 +1,9 @@
 import time
+import os
 import cv2
 import numpy as np
+import requests
+from datetime import datetime
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
@@ -30,6 +33,10 @@ _SKELETON = [
 
 _KPT_CONF_THRESHOLD = 0.3
 
+# FastAPI 서버 연동 상수
+_API_URL = "http://127.0.0.1:8000/api/alert"
+_ALERT_COOLDOWN_SEC = 10
+_EVENT_IMAGE_DIR = "event_captures"
 
 def _track_color(track_id) -> tuple:
     return _COLOR_PALETTE[int(track_id) % len(_COLOR_PALETTE)]
@@ -96,7 +103,8 @@ class VideoThread(QThread):
     finished_signal = pyqtSignal()
 
     def __init__(self, source, model_path: str, conf: float, max_age: int,
-                 kpt_model_path: str = "", imgsz: int = 640):
+                 kpt_model_path: str = "", imgsz: int = 640,
+                 detect_interval: int = 1):
         super().__init__()
         self.source = source
         self.model_path = model_path  # 항상 YOLO pose 모델
@@ -104,12 +112,21 @@ class VideoThread(QThread):
         self.max_age = max_age
         self.kpt_model_path = kpt_model_path  # 키포인트 행동 분류 모델 경로 (선택)
         self.imgsz = imgsz                    # 추론 해상도 (경량화)
+        # N프레임마다 YOLO 검출 실행, 사이 프레임은 직전 결과 재사용
+        # (Raspberry Pi 등 CPU 환경에서 다중 카메라 구동 시 부하 분산)
+        self.detect_interval = max(1, int(detect_interval))
         self._running = False
         self._paused = False
         self.show_bbox = True
         self.show_track_id = True
         self.show_keypoints = True
         self.show_kpt_behavior = True  # 키포인트 행동 분류 결과 표시 여부
+        
+        # FastAPI 알림 연동: 쿨타임 관리
+        self.last_alert_time = 0
+
+        # 이벤트 이미지 저장 디렉토리 생성
+        os.makedirs(_EVENT_IMAGE_DIR, exist_ok=True)
 
     @property
     def _is_live(self) -> bool:
@@ -121,7 +138,17 @@ class VideoThread(QThread):
 
     def _open_capture(self):
         """소스에 맞는 VideoCapture를 열고 반환한다."""
-        if self._is_live and not isinstance(self.source, int):
+        if isinstance(self.source, int):
+            # 웹캠 — 플랫폼별 최적 백엔드 사용, 실패 시 기본 백엔드 재시도
+            #   Windows(개발 PC): DSHOW가 MSMF보다 열기 빠르고 다중 카메라 충돌이 적다
+            #   Raspberry Pi OS(운영): V4L2 명시 — /dev/video{N} 직접 사용
+            import sys
+            backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+            cap = cv2.VideoCapture(self.source, backend)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(self.source)
+        elif self._is_live:
             # RTSP: FFmpeg 백엔드 우선 사용, 버퍼 최소화로 지연 감소
             cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -155,6 +182,9 @@ class VideoThread(QThread):
             _reconnect_count = 0
 
             prev_time = time.time()
+            frame_idx = 0
+            # detect_interval > 1 일 때 사이 프레임에 재사용할 직전 검출 결과
+            tracks, kpt_map, behavior_map = [], {}, {}
             while self._running:
                 if self._paused:
                     time.sleep(0.05)
@@ -188,18 +218,21 @@ class VideoThread(QThread):
                 fps = 1.0 / max(now - prev_time, 1e-6)
                 prev_time = now
 
-                detector.set_confidence(self.conf)
-                detections = detector.detect(frame)
-                tracks = tracker.update(detections, frame)
+                # detect_interval 마다만 YOLO 검출 — 사이 프레임은 직전 결과 재사용
+                if frame_idx % self.detect_interval == 0:
+                    detector.set_confidence(self.conf)
+                    detections = detector.detect(frame)
+                    tracks = tracker.update(detections, frame)
 
-                kpt_map = {}
-                if detector.is_pose:
-                    kpt_map = _match_keypoints(tracks, detections)
+                    kpt_map = {}
+                    if detector.is_pose:
+                        kpt_map = _match_keypoints(tracks, detections)
 
-                # 키포인트 행동 분류 (pose 모델 + kpt_model 지정 시)
-                behavior_map = {}
-                if kpt_buf is not None and self.show_kpt_behavior:
-                    behavior_map = kpt_buf.update(tracks, kpt_map)
+                    # 키포인트 행동 분류 (pose 모델 + kpt_model 지정 시)
+                    behavior_map = {}
+                    if kpt_buf is not None and self.show_kpt_behavior:
+                        behavior_map = kpt_buf.update(tracks, kpt_map)
+                frame_idx += 1
 
                 self._draw(frame, tracks,
                            kpt_map if self.show_keypoints else {},
@@ -207,6 +240,36 @@ class VideoThread(QThread):
                 self.stats_updated.emit(len(tracks), fps)
                 cid, bconf = _summarize_behavior(behavior_map)
                 self.behavior_ready.emit(cid, bconf)
+                
+                # ===== FastAPI 알림 연동 =====
+                current_time = time.time()
+                anomaly_score = float(bconf)
+                if len(tracks) > 0 and cid != 0 and anomaly_score >= 0.90 and (current_time - self.last_alert_time > _ALERT_COOLDOWN_SEC):
+                    self.last_alert_time = current_time
+
+                    # 1) 사진 저장
+                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    img_name = f"evt_{timestamp_str}.jpg"
+                    img_path = os.path.join(_EVENT_IMAGE_DIR, img_name)
+                    cv2.imwrite(img_path, frame)
+
+                    # 2) JSON 데이터 구성 (팀 설계 구조)
+                    anomaly_type = label_en(cid) if cid != -1 else "정상"
+                    payload = {
+                        "event_id": f"evt_{timestamp_str}",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "anomaly_type": anomaly_type,
+                        "image_path": os.path.abspath(img_path),
+                        "anomaly_score": float(bconf)
+                    }
+
+                    # 3) FastAPI 서버로 POST 전송
+                    try:
+                        response = requests.post(_API_URL, json=payload, timeout=2)
+                        print(f"✅ FastAPI 전송 성공! (상태코드: {response.status_code})")
+                    except requests.exceptions.RequestException as e:
+                        print(f"❌ FastAPI 전송 실패: {e}")
+                # ===== FastAPI 알림 연동 끝 =====
 
                 self.frame_ready.emit(self._to_qimage(frame))
 

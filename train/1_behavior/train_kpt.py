@@ -28,12 +28,12 @@ from torch.utils.data import DataLoader
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from model_kpt import KeypointLSTM
+from model_kpt import KeypointLSTMv2
 from dataset_kpt import KptBehaviorDataset, LABEL_NAMES
 
 # ── 설정 ─────────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = os.path.join(_HERE, "output")
-EPOCHS = 60
+EPOCHS = 80
 BATCH_SIZE = 64
 LR = 3e-4
 LR_MIN = 3e-5
@@ -170,14 +170,15 @@ def main():
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-    model = KeypointLSTM(hidden=HIDDEN, num_layers=NUM_LAYERS,
-                         num_classes=len(LABEL_NAMES), dropout=DROPOUT)
+    model = KeypointLSTMv2(hidden=HIDDEN, num_layers=NUM_LAYERS,
+                           num_classes=len(LABEL_NAMES), dropout=DROPOUT)
     if len(GPUS) > 1:
         model = nn.DataParallel(model, device_ids=GPUS)
     model = model.to(device)
 
     weight = train_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
+    # label_smoothing: 영상 전체에 단일 라벨을 부여한 약지도 노이즈 완화
+    criterion = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

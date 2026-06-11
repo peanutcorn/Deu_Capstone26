@@ -1,14 +1,21 @@
 import os
+import math
+
+import torch
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QSlider,
-    QFileDialog, QHBoxLayout, QVBoxLayout, QGroupBox,
+    QFileDialog, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox,
     QSizePolicy, QStatusBar, QComboBox, QCheckBox, QSpinBox,
     QMessageBox, QFrame, QLineEdit
 )
-from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QPixmap, QFont, QIcon
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QPixmap, QFont
 
 from core.video_thread import VideoThread
+
+# CPU 전용 환경(Raspberry Pi 5 등)은 부하 때문에 동시 소스 수를 제한한다
+_HAS_CUDA = torch.cuda.is_available()
+MAX_SOURCES = 9 if _HAS_CUDA else 4
 
 
 def _default_kpt_behavior_model_path() -> str:
@@ -26,7 +33,7 @@ class VideoDisplay(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background-color: #1a1a2e;")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(280, 180)
         self._pixmap = None
 
     def set_frame(self, pixmap: QPixmap):
@@ -44,12 +51,63 @@ class VideoDisplay(QLabel):
             self.setPixmap(scaled)
 
 
+class VideoTile(QFrame):
+    """다중 소스 그리드의 단일 타일 — 제목줄 + 영상 + 상태줄."""
+
+    close_requested = pyqtSignal(int)   # source_id
+
+    def __init__(self, source_id: int, title: str):
+        super().__init__()
+        self.source_id = source_id
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "VideoTile { border: 1px solid #2e2e4e; border-radius: 6px; "
+            "background-color: #16162a; }"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        header = QHBoxLayout()
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setStyleSheet("color: #aaaacc; font-size: 11px; font-weight: bold;")
+        btn_close = QPushButton("✕")
+        btn_close.setFixedSize(20, 20)
+        btn_close.setToolTip("이 소스 닫기")
+        btn_close.clicked.connect(lambda: self.close_requested.emit(self.source_id))
+        header.addWidget(self.lbl_title)
+        header.addStretch()
+        header.addWidget(btn_close)
+        layout.addLayout(header)
+
+        self.display = VideoDisplay()
+        self.display.setText("연결 중...")
+        self.display.setStyleSheet(
+            "background-color: #1a1a2e; color: #8888aa; border-radius: 4px;"
+        )
+        layout.addWidget(self.display, stretch=1)
+
+        self.lbl_status = QLabel("인원 — | FPS —")
+        self.lbl_status.setStyleSheet("color: #8888aa; font-size: 10px;")
+        layout.addWidget(self.lbl_status)
+
+    def set_stats(self, count: int, fps: float):
+        self.lbl_status.setText(f"인원 {count} | FPS {fps:.1f}")
+
+    def set_finished(self):
+        self.lbl_status.setText("재생 완료")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCTV 이상 현상 감지 시스템")
         self.resize(1280, 780)
-        self._thread: VideoThread | None = None
+        # source_id → {"thread", "tile", "title", "count", "fps", "behavior"}
+        self._sources: dict[int, dict] = {}
+        self._next_id = 0
+        self._all_paused = False
         self._build_ui()
         self._apply_stylesheet()
 
@@ -66,7 +124,7 @@ class MainWindow(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("대기 중 — 파일 또는 웹캠을 선택하세요.")
+        self.status_bar.showMessage("대기 중 — 파일, 웹캠 또는 IP 카메라를 추가하세요.")
 
     def _build_video_panel(self) -> QWidget:
         panel = QWidget()
@@ -74,25 +132,34 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self.video_display = VideoDisplay()
-        self.video_display.setText("영상을 불러오세요")
-        self.video_display.setFont(QFont("Malgun Gothic", 16))
-        self.video_display.setStyleSheet(
+        # 다중 소스 그리드
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.grid_layout.setSpacing(6)
+
+        self.placeholder = QLabel("영상 소스를 추가하세요\n(웹캠 여러 대 동시 연결 가능)")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setFont(QFont("Malgun Gothic", 16))
+        self.placeholder.setStyleSheet(
             "background-color: #1a1a2e; color: #8888aa; border-radius: 6px;"
         )
-        layout.addWidget(self.video_display)
+        self.placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.grid_layout.addWidget(self.placeholder, 0, 0)
 
-        # 하단 재생 컨트롤
+        layout.addWidget(self.grid_container, stretch=1)
+
+        # 하단 재생 컨트롤 (전체 소스 일괄 제어)
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
-        self.btn_play = QPushButton("▶  재생")
+        self.btn_play = QPushButton("⏸  전체 일시정지")
         self.btn_play.setFixedHeight(36)
         self.btn_play.clicked.connect(self._on_play_pause)
         self.btn_play.setEnabled(False)
 
-        self.btn_stop = QPushButton("■  정지")
+        self.btn_stop = QPushButton("■  전체 정지")
         self.btn_stop.setFixedHeight(36)
-        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_stop.clicked.connect(self._on_stop_all)
         self.btn_stop.setEnabled(False)
 
         ctrl.addWidget(self.btn_play)
@@ -116,16 +183,25 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_source_group(self) -> QGroupBox:
-        grp = QGroupBox("영상 소스")
+        grp = QGroupBox("영상 소스 (다중 연결)")
         layout = QVBoxLayout(grp)
 
-        self.btn_open_file = QPushButton("파일 열기...")
+        self.btn_open_file = QPushButton("파일 추가...")
         self.btn_open_file.setFixedHeight(34)
         self.btn_open_file.clicked.connect(self._on_open_file)
 
-        self.btn_webcam = QPushButton("웹캠 시작")
-        self.btn_webcam.setFixedHeight(34)
-        self.btn_webcam.clicked.connect(self._on_webcam)
+        # 웹캠 — 인덱스 선택 후 추가 (여러 대 동시 연결 가능)
+        lbl_cam = QLabel("웹캠 (인덱스 선택 후 추가)")
+        lbl_cam.setStyleSheet("color: #aaaacc; font-size: 11px; margin-top: 4px;")
+        cam_row = QHBoxLayout()
+        self.spin_cam = QSpinBox()
+        self.spin_cam.setRange(0, 7)
+        self.spin_cam.setValue(0)
+        self.btn_webcam = QPushButton("웹캠 추가")
+        self.btn_webcam.setFixedHeight(28)
+        self.btn_webcam.clicked.connect(self._on_add_webcam)
+        cam_row.addWidget(self.spin_cam)
+        cam_row.addWidget(self.btn_webcam, stretch=1)
 
         # IP 카메라 RTSP
         lbl_rtsp = QLabel("IP 카메라 (RTSP)")
@@ -133,19 +209,19 @@ class MainWindow(QMainWindow):
         rtsp_row = QHBoxLayout()
         self.edit_rtsp = QLineEdit()
         self.edit_rtsp.setPlaceholderText("rtsp://user:pass@ip:port/path")
-        self.btn_rtsp = QPushButton("연결")
+        self.btn_rtsp = QPushButton("추가")
         self.btn_rtsp.setFixedWidth(46)
         self.btn_rtsp.setFixedHeight(28)
         self.btn_rtsp.clicked.connect(self._on_rtsp)
         rtsp_row.addWidget(self.edit_rtsp)
         rtsp_row.addWidget(self.btn_rtsp)
 
-        self.lbl_source = QLabel("소스: (없음)")
-        self.lbl_source.setWordWrap(True)
+        self.lbl_source = QLabel(f"연결된 소스: 0 / {MAX_SOURCES}")
         self.lbl_source.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
         layout.addWidget(self.btn_open_file)
-        layout.addWidget(self.btn_webcam)
+        layout.addWidget(lbl_cam)
+        layout.addLayout(cam_row)
         layout.addWidget(lbl_rtsp)
         layout.addLayout(rtsp_row)
         layout.addWidget(self.lbl_source)
@@ -193,8 +269,22 @@ class MainWindow(QMainWindow):
             "480  (빠름·권장)",
             "640  (정확)",
         ])
-        self.combo_imgsz.setCurrentIndex(1)  # 480 기본
+        # CPU 전용(Raspberry Pi)은 384 기본, CUDA PC는 480 기본
+        self.combo_imgsz.setCurrentIndex(1 if _HAS_CUDA else 0)
         layout.addWidget(self.combo_imgsz)
+
+        # 검출 간격 — N프레임마다 YOLO 실행 (사이 프레임은 직전 결과 재사용)
+        lbl_interval = QLabel("검출 간격 (다중 카메라 경량화)")
+        lbl_interval.setStyleSheet("color: #aaaacc; font-size: 11px; margin-top: 2px;")
+        layout.addWidget(lbl_interval)
+        self.combo_interval = QComboBox()
+        self.combo_interval.addItems([
+            "1  (매 프레임)",
+            "2  (1프레임 건너뜀)",
+            "3  (2프레임 건너뜀)",
+        ])
+        self.combo_interval.setCurrentIndex(0 if _HAS_CUDA else 1)
+        layout.addWidget(self.combo_interval)
 
         # 구분선
         line = QFrame()
@@ -239,10 +329,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.chk_track_id)
         layout.addWidget(self.chk_keypoints)
         layout.addWidget(self.chk_kpt_behavior)
+
+        # 체크박스 → 실행 중인 모든 스레드에 실시간 반영
+        # bool 단순 속성 쓰기는 GIL이 원자성을 보장하므로 별도 락 불필요
+        self.chk_bbox.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_bbox', bool(s)))
+        self.chk_track_id.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_track_id', bool(s)))
+        self.chk_keypoints.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_keypoints', bool(s)))
+        self.chk_kpt_behavior.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_kpt_behavior', bool(s)))
         return grp
 
     def _build_stats_group(self) -> QGroupBox:
-        grp = QGroupBox("실시간 통계")
+        grp = QGroupBox("실시간 통계 (전체 합산)")
         layout = QVBoxLayout(grp)
 
         self.lbl_count = QLabel("감지된 인원: 0명")
@@ -250,6 +351,7 @@ class MainWindow(QMainWindow):
         self.lbl_count.setStyleSheet("color: #00d4aa;")
 
         self.lbl_behavior = QLabel("이상행동: —")
+        self.lbl_behavior.setWordWrap(True)
         self.lbl_behavior.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
         self.lbl_behavior.setStyleSheet("color: #00d4aa;")
 
@@ -262,21 +364,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_fps)
         return grp
 
-    # ------------------------------------------------------------------ 이벤트
+    # ------------------------------------------------------------------ 소스 추가 이벤트
     def _on_open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "동영상 파일 선택", "",
             "동영상 파일 (*.mp4 *.avi *.mkv *.mov *.wmv *.flv);;모든 파일 (*)"
         )
         if path:
-            self._stop_thread()
-            self.lbl_source.setText(f"파일: {os.path.basename(path)}")
-            self._start_thread(path)
+            self._add_source(path, f"파일: {os.path.basename(path)}")
 
-    def _on_webcam(self):
-        self._stop_thread()
-        self.lbl_source.setText("소스: 웹캠 (0)")
-        self._start_thread(0)
+    def _on_add_webcam(self):
+        idx = self.spin_cam.value()
+        for src in self._sources.values():
+            if src["thread"].source == idx:
+                QMessageBox.information(
+                    self, "이미 연결됨", f"웹캠 {idx} 는 이미 연결되어 있습니다.")
+                return
+        self._add_source(idx, f"웹캠 {idx}")
 
     def _on_rtsp(self):
         url = self.edit_rtsp.text().strip()
@@ -286,29 +390,28 @@ class MainWindow(QMainWindow):
         if not url.startswith(("rtsp://", "rtmp://", "http://", "https://")):
             QMessageBox.warning(self, "URL 형식 오류", "rtsp:// 로 시작하는 URL을 입력하세요.")
             return
-        self._stop_thread()
-        self.lbl_source.setText(f"IP 카메라: {url}")
-        self._start_thread(url)
+        for src in self._sources.values():
+            if src["thread"].source == url:
+                QMessageBox.information(self, "이미 연결됨", "해당 RTSP 소스는 이미 연결되어 있습니다.")
+                return
+        self._add_source(url, f"IP 카메라: {url.split('@')[-1][:30]}")
 
+    # ------------------------------------------------------------------ 재생 제어
     def _on_play_pause(self):
-        if self._thread is None:
+        if not self._sources:
             return
-        if self._thread._paused:
-            self._thread.resume()
-            self.btn_play.setText("⏸  일시정지")
-        else:
-            self._thread.pause()
-            self.btn_play.setText("▶  재생")
+        self._all_paused = not self._all_paused
+        for src in self._sources.values():
+            if self._all_paused:
+                src["thread"].pause()
+            else:
+                src["thread"].resume()
+        self.btn_play.setText("▶  전체 재생" if self._all_paused else "⏸  전체 일시정지")
 
-    def _on_stop(self):
-        self._stop_thread()
-        self.video_display.setText("영상을 불러오세요")
-        self.video_display._pixmap = None
-        self.lbl_count.setText("감지된 인원: 0명")
-        self.lbl_behavior.setText("이상행동: —")
-        self.lbl_behavior.setStyleSheet("color: #00d4aa;")
-        self.lbl_fps.setText("FPS: —")
-        self.status_bar.showMessage("정지됨.")
+    def _on_stop_all(self):
+        for sid in list(self._sources):
+            self._remove_source(sid)
+        self.status_bar.showMessage("전체 정지됨.")
 
     def _on_browse_kpt_behavior(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -321,40 +424,85 @@ class MainWindow(QMainWindow):
     def _on_conf_changed(self, value: int):
         conf = value / 100.0
         self.lbl_conf_val.setText(f"{conf:.2f}")
-        if self._thread:
-            self._thread.set_conf(conf)
+        for src in self._sources.values():
+            src["thread"].set_conf(conf)
 
-    def _on_frame(self, qimg):
-        pixmap = QPixmap.fromImage(qimg)
-        self.video_display.set_frame(pixmap)
+    def _set_thread_attr(self, name: str, value: bool):
+        for src in self._sources.values():
+            setattr(src["thread"], name, value)
 
-    def _on_stats(self, count: int, fps: float):
-        self.lbl_count.setText(f"감지된 인원: {count}명")
-        self.lbl_fps.setText(f"FPS: {fps:.1f}")
+    # ------------------------------------------------------------------ 스레드 콜백
+    def _on_frame(self, sid: int, qimg):
+        src = self._sources.get(sid)
+        if src:
+            src["tile"].display.set_frame(QPixmap.fromImage(qimg))
 
-    def _on_behavior(self, class_id: int, conf: float):
+    def _on_stats(self, sid: int, count: int, fps: float):
+        src = self._sources.get(sid)
+        if src is None:
+            return
+        src["count"], src["fps"] = count, fps
+        src["tile"].set_stats(count, fps)
+        self._update_aggregate_stats()
+
+    def _on_behavior(self, sid: int, class_id: int, conf: float):
+        src = self._sources.get(sid)
+        if src is None:
+            return
+        src["behavior"] = (class_id, conf)
+        self._update_behavior_label()
+
+    def _on_error(self, sid: int, msg: str):
+        src = self._sources.get(sid)
+        title = src["title"] if src else f"소스 {sid}"
+        self._remove_source(sid)
+        QMessageBox.critical(self, "오류", f"[{title}]\n{msg}")
+
+    def _on_thread_finished(self, sid: int):
+        src = self._sources.get(sid)
+        if src:
+            src["tile"].set_finished()
+
+    # ------------------------------------------------------------------ 집계 표시
+    def _update_aggregate_stats(self):
+        total = sum(s["count"] for s in self._sources.values())
+        fps_list = [s["fps"] for s in self._sources.values() if s["fps"] > 0]
+        self.lbl_count.setText(f"감지된 인원: {total}명")
+        if fps_list:
+            self.lbl_fps.setText(f"FPS: {sum(fps_list) / len(fps_list):.1f} (평균)")
+        else:
+            self.lbl_fps.setText("FPS: —")
+
+    def _update_behavior_label(self):
         from core.labels import label_kr
-        if class_id < 0:
+        # 모든 소스 중 가장 신뢰도 높은 이상행동을 대표로 표시
+        best_abn = None     # (conf, class_id, title)
+        best_norm = None    # (conf,)
+        for src in self._sources.values():
+            cid, conf = src["behavior"]
+            if cid > 0:
+                if best_abn is None or conf > best_abn[0]:
+                    best_abn = (conf, cid, src["title"])
+            elif cid == 0:
+                if best_norm is None or conf > best_norm[0]:
+                    best_norm = (conf,)
+
+        if best_abn is not None:
+            conf, cid, title = best_abn
+            self.lbl_behavior.setText(
+                f"이상행동: {label_kr(cid)} ({conf * 100:.0f}%) — {title}")
+            self.lbl_behavior.setStyleSheet("color: #ff4d4d;")
+        elif best_norm is not None:
+            self.lbl_behavior.setText(f"이상행동: 정상 ({best_norm[0] * 100:.0f}%)")
+            self.lbl_behavior.setStyleSheet("color: #00d4aa;")
+        elif self._sources:
             self.lbl_behavior.setText("이상행동: 분석 중...")
             self.lbl_behavior.setStyleSheet("color: #aaaaaa;")
-            return
-        name = label_kr(class_id)
-        self.lbl_behavior.setText(f"이상행동: {name} ({conf * 100:.0f}%)")
-        # 정상=초록, 그 외=빨강 강조
-        color = "#00d4aa" if class_id == 0 else "#ff4d4d"
-        self.lbl_behavior.setStyleSheet(f"color: {color};")
+        else:
+            self.lbl_behavior.setText("이상행동: —")
+            self.lbl_behavior.setStyleSheet("color: #00d4aa;")
 
-    def _on_error(self, msg: str):
-        QMessageBox.critical(self, "오류", msg)
-        self._stop_thread()
-
-    def _on_thread_finished(self):
-        self.btn_play.setEnabled(False)
-        self.btn_stop.setEnabled(False)
-        self.btn_play.setText("▶  재생")
-        self.status_bar.showMessage("재생 완료.")
-
-    # ------------------------------------------------------------------ 스레드
+    # ------------------------------------------------------------------ 소스 관리
     def _resolve_model_path(self) -> str:
         # 콤보 항목은 "yolo11n-pose.pt  (경량·권장)" 형태 → 첫 토큰이 실제 파일명
         return self.combo_model.currentText().split()[0]
@@ -362,11 +510,22 @@ class MainWindow(QMainWindow):
     def _resolve_imgsz(self) -> int:
         return int(self.combo_imgsz.currentText().split()[0])
 
-    def _start_thread(self, source):
+    def _resolve_interval(self) -> int:
+        return int(self.combo_interval.currentText().split()[0])
+
+    def _add_source(self, source, title: str):
+        if len(self._sources) >= MAX_SOURCES:
+            QMessageBox.warning(
+                self, "소스 한도 초과",
+                f"동시 연결은 최대 {MAX_SOURCES}개까지 지원합니다."
+                + ("" if _HAS_CUDA else "\n(CPU 전용 환경 부하 제한)"))
+            return
+
         model = self._resolve_model_path()
         conf = self.slider_conf.value() / 100.0
         max_age = self.spin_max_age.value()
         imgsz = self._resolve_imgsz()
+        interval = self._resolve_interval()
 
         # 키포인트 행동 분류 모델 경로 (파일이 존재할 때만 전달)
         kpt_model = self.edit_kpt_behavior_model.text().strip()
@@ -375,46 +534,101 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(
                 "이상행동 모델(kpt_behavior.pth) 미지정 — 감지·추적만 동작합니다.")
 
-        self._thread = VideoThread(source, model, conf, max_age,
-                                   kpt_model_path=kpt_model, imgsz=imgsz)
-        self._thread.show_bbox = self.chk_bbox.isChecked()
-        self._thread.show_track_id = self.chk_track_id.isChecked()
-        self._thread.show_keypoints = self.chk_keypoints.isChecked()
-        self._thread.show_kpt_behavior = self.chk_kpt_behavior.isChecked()
-        self._thread.frame_ready.connect(self._on_frame)
-        self._thread.stats_updated.connect(self._on_stats)
-        self._thread.behavior_ready.connect(self._on_behavior)
-        self._thread.error_occurred.connect(self._on_error)
-        self._thread.finished_signal.connect(self._on_thread_finished)
+        sid = self._next_id
+        self._next_id += 1
 
-        # 체크박스 상태를 스레드에 실시간 반영
-        # bool 단순 속성 쓰기는 GIL이 원자성을 보장하므로 별도 락 불필요
-        self.chk_bbox.stateChanged.connect(
-            lambda s: setattr(self._thread, 'show_bbox', bool(s))
-        )
-        self.chk_track_id.stateChanged.connect(
-            lambda s: setattr(self._thread, 'show_track_id', bool(s))
-        )
-        self.chk_keypoints.stateChanged.connect(
-            lambda s: setattr(self._thread, 'show_keypoints', bool(s))
-        )
-        self.chk_kpt_behavior.stateChanged.connect(
-            lambda s: setattr(self._thread, 'show_kpt_behavior', bool(s))
-        )
+        thread = VideoThread(source, model, conf, max_age,
+                             kpt_model_path=kpt_model, imgsz=imgsz,
+                             detect_interval=interval)
+        thread.show_bbox = self.chk_bbox.isChecked()
+        thread.show_track_id = self.chk_track_id.isChecked()
+        thread.show_keypoints = self.chk_keypoints.isChecked()
+        thread.show_kpt_behavior = self.chk_kpt_behavior.isChecked()
 
-        self._thread.start()
+        tile = VideoTile(sid, title)
+        tile.close_requested.connect(self._remove_source)
+
+        # sid 를 기본 인자로 바인딩해 소스별 콜백 분기
+        thread.frame_ready.connect(lambda img, s=sid: self._on_frame(s, img))
+        thread.stats_updated.connect(lambda c, f, s=sid: self._on_stats(s, c, f))
+        thread.behavior_ready.connect(lambda cid, cf, s=sid: self._on_behavior(s, cid, cf))
+        thread.error_occurred.connect(lambda m, s=sid: self._on_error(s, m))
+        thread.finished_signal.connect(lambda s=sid: self._on_thread_finished(s))
+
+        self._sources[sid] = {
+            "thread": thread, "tile": tile, "title": title,
+            "count": 0, "fps": 0.0, "behavior": (-1, 0.0),
+        }
+
+        # 새 소스 추가 시 전체 일시정지 상태 해제
+        if self._all_paused:
+            self._all_paused = False
+            for src in self._sources.values():
+                src["thread"].resume()
+
+        self._relayout_grid()
+        thread.start()
+
         self.btn_play.setEnabled(True)
-        self.btn_play.setText("⏸  일시정지")
+        self.btn_play.setText("⏸  전체 일시정지")
         self.btn_stop.setEnabled(True)
-        self.status_bar.showMessage("처리 중...")
+        self.status_bar.showMessage(f"{title} 연결됨 — 처리 중...")
+        self._update_source_count()
 
-    def _stop_thread(self):
-        if self._thread and self._thread.isRunning():
-            self._thread.stop()
-        self._thread = None
+    def _remove_source(self, sid: int):
+        src = self._sources.pop(sid, None)
+        if src is None:
+            return
+        thread = src["thread"]
+        if thread.isRunning():
+            thread.stop()
+        src["tile"].setParent(None)
+        src["tile"].deleteLater()
+
+        self._relayout_grid()
+        self._update_source_count()
+        self._update_aggregate_stats()
+        self._update_behavior_label()
+        if not self._sources:
+            self.btn_play.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.btn_play.setText("⏸  전체 일시정지")
+            self._all_paused = False
+            self.lbl_count.setText("감지된 인원: 0명")
+            self.lbl_fps.setText("FPS: —")
+
+    def _update_source_count(self):
+        self.lbl_source.setText(f"연결된 소스: {len(self._sources)} / {MAX_SOURCES}")
+
+    def _relayout_grid(self):
+        """타일 수에 맞춰 그리드 재배치 — 1개: 1열, ≤4개: 2열, 그 외: 3열."""
+        # 기존 위젯 전부 제거 (삭제 아님)
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+        tiles = [s["tile"] for s in self._sources.values()]
+        if not tiles:
+            self.grid_layout.addWidget(self.placeholder, 0, 0)
+            self.placeholder.show()
+            return
+
+        self.placeholder.hide()
+        n = len(tiles)
+        cols = 1 if n == 1 else (2 if n <= 4 else 3)
+        rows = math.ceil(n / cols)
+        for i, tile in enumerate(tiles):
+            self.grid_layout.addWidget(tile, i // cols, i % cols)
+        for r in range(rows):
+            self.grid_layout.setRowStretch(r, 1)
+        for c in range(cols):
+            self.grid_layout.setColumnStretch(c, 1)
 
     def closeEvent(self, event):
-        self._stop_thread()
+        for sid in list(self._sources):
+            self._remove_source(sid)
         event.accept()
 
     # ------------------------------------------------------------------ 스타일

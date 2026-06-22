@@ -133,7 +133,8 @@ class VideoThread(QThread):
         self.show_track_id = True
         self.show_keypoints = True
         self.show_kpt_behavior = True  # 키포인트 행동 분류 결과 표시 여부
-        self.show_stand = True         # 물품 가판대 감지 결과 표시 여부
+        self.show_stand = True         # 물품 가판대(class 0) 표시 여부
+        self.show_pos = True           # 결제기(class 1) 표시 여부
         
         # FastAPI 알림 연동: 쿨타임 관리 + 비동기 전송/서킷 브레이커
         self.last_alert_time = 0
@@ -325,10 +326,14 @@ class VideoThread(QThread):
                                 behavior_map[tid] = (6, 0.9)
                 frame_idx += 1
 
+                # 가판대(0)/결제기(1) 표시는 각각의 토글로 필터 (감지 자체는 도난규칙 위해 항상 수행)
+                shown_objects = [o for o in objects
+                                 if (o.get("cls") == 0 and self.show_stand)
+                                 or (o.get("cls") == 1 and self.show_pos)]
                 self._draw(frame, tracks,
                            kpt_map if self.show_keypoints else {},
                            behavior_map,
-                           objects if self.show_stand else [])
+                           shown_objects)
                 self.stats_updated.emit(len(tracks), fps)
                 cid, bconf = _summarize_behavior(behavior_map)
                 self.behavior_ready.emit(cid, bconf)

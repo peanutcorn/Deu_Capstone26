@@ -425,18 +425,21 @@ class MainWindow(QMainWindow):
         self.chk_keypoints.setChecked(True)
         self.chk_kpt_behavior = QCheckBox("키포인트 행동 분류")
         self.chk_kpt_behavior.setChecked(True)
-        self.chk_stand = QCheckBox("가판대·결제기 감지")
-        # 가판대 모델(model/stand.pt)이 있을 때만 기본 체크/활성
-        _has_stand = bool(_default_stand_model_path())
-        self.chk_stand.setChecked(_has_stand)
-        self.chk_stand.setEnabled(_has_stand)
-        if not _has_stand:
-            self.chk_stand.setToolTip("model/stand.pt 가 없습니다 (가판대 모델 미학습)")
+        # 가판대·결제기를 각각 독립 토글 (model/objects.pt 있을 때만 활성)
+        _has_obj = bool(_default_stand_model_path())
+        self.chk_stand = QCheckBox("물품 가판대 감지")
+        self.chk_pos = QCheckBox("결제기(POS) 감지")
+        for chk in (self.chk_stand, self.chk_pos):
+            chk.setChecked(_has_obj)
+            chk.setEnabled(_has_obj)
+            if not _has_obj:
+                chk.setToolTip("model/objects.pt 가 없습니다 (객체 모델 미학습)")
         layout.addWidget(self.chk_bbox)
         layout.addWidget(self.chk_track_id)
         layout.addWidget(self.chk_keypoints)
         layout.addWidget(self.chk_kpt_behavior)
         layout.addWidget(self.chk_stand)
+        layout.addWidget(self.chk_pos)
 
         # 체크박스 → 실행 중인 모든 스레드에 실시간 반영
         # bool 단순 속성 쓰기는 GIL이 원자성을 보장하므로 별도 락 불필요
@@ -450,6 +453,8 @@ class MainWindow(QMainWindow):
             lambda s: self._set_thread_attr('show_kpt_behavior', bool(s)))
         self.chk_stand.stateChanged.connect(
             lambda s: self._set_thread_attr('show_stand', bool(s)))
+        self.chk_pos.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_pos', bool(s)))
         return grp
 
     def _build_stats_group(self) -> QGroupBox:
@@ -657,6 +662,7 @@ class MainWindow(QMainWindow):
         thread.show_keypoints = self.chk_keypoints.isChecked()
         thread.show_kpt_behavior = self.chk_kpt_behavior.isChecked()
         thread.show_stand = self.chk_stand.isChecked()
+        thread.show_pos = self.chk_pos.isChecked()
 
         tile = VideoTile(sid, title)
         tile.close_requested.connect(self._remove_source)

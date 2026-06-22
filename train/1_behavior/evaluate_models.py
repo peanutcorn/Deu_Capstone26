@@ -21,30 +21,16 @@ import time
 
 import numpy as np
 import torch
-import cv2
 from torch.utils.data import DataLoader
-
-# OpenCV 는 Windows에서 비ASCII(한글) 경로를 cv2.imread 로 못 읽는다.
-# 프로젝트 경로에 '과제'가 포함되므로, 유니코드 경로 안전 로더로 패치한다.
-_orig_imread = cv2.imread
-def _safe_imread(path, flags=cv2.IMREAD_COLOR):
-    try:
-        data = np.fromfile(path, dtype=np.uint8)
-        img = cv2.imdecode(data, flags)
-        return img if img is not None else _orig_imread(path, flags)
-    except Exception:
-        return _orig_imread(path, flags)
-cv2.imread = _safe_imread
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-import config as C
 from model_kpt import KeypointLSTM, KeypointLSTMv2
 from dataset_kpt import KptBehaviorDataset, LABEL_NAMES
-from dataset import BehaviorDataset, build_transform
-from train import LSTM_NIA
 
 NUM_CLASSES = 8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -168,52 +154,63 @@ def evaluate_kpt(weights, npz_path):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2) ConvLSTM(RGB) 모델 평가
+# 2) 데모 영상 온셋 감지 평가 — 앱과 동일한 추론 경로(헤드리스)
 # ──────────────────────────────────────────────────────────────────────────
-def load_convlstm_model(path):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    from collections import OrderedDict
-    state = OrderedDict((k[7:] if k.startswith("module.") else k, v)
-                        for k, v in state.items())
-    model = LSTM_NIA(hidden_size=C.HIDDEN_SIZE, num_classes=C.NUM_CLASSES,
-                     num_layers=C.NUM_LAYERS)
-    model.load_state_dict(state)
-    n_params = sum(p.numel() for p in model.parameters())
-    epoch = ckpt.get("epoch") if isinstance(ckpt, dict) else None
-    return model, n_params, "LSTM_NIA (ResNet50+LSTM)", epoch
-
-
 @torch.no_grad()
-def evaluate_convlstm(weights, csv_name):
-    print(f"\n[2] ConvLSTM 모델 평가: {os.path.basename(weights)}")
-    model, n_params, arch, epoch = load_convlstm_model(weights)
-    model = model.to(DEVICE).eval()
-    csv_path = os.path.join(_HERE, C.SPLIT_DIR, csv_name)
-    ds = BehaviorDataset(C.DATA_ROOT, csv_path, transform=build_transform())
-    loader = DataLoader(ds, batch_size=32, shuffle=False, num_workers=0)
-    print(f"    아키텍처 {arch}  파라미터 {n_params:,}  테스트표본 {len(ds)}")
+def evaluate_onset(kpt_weights, object_weights, demo_onset, conf=0.4, imgsz=480):
+    """각 데모 영상에서 목표 이상행동이 처음 감지되는 프레임을 측정해
+    요청 온셋과 비교한다. 앱(VideoThread)과 동일한 컴포넌트를 직접 구동."""
+    from core.detector import HumanDetector, ObjectDetector
+    from core.tracker import HumanTracker
+    from core.kpt_behavior_classifier import TrackBehaviorBuffer
+    from core.theft_monitor import TheftMonitor
+    from core.video_thread import _match_keypoints, _summarize_behavior
+    import cv2
 
-    y_true, y_pred = [], []
-    t0 = time.time()
-    for bi, (imgs, labels) in enumerate(loader):
-        out = model(imgs.to(DEVICE))
-        y_pred.extend(out.argmax(dim=1).cpu().tolist())
-        y_true.extend(labels.tolist() if torch.is_tensor(labels) else list(labels))
-        if bi % 20 == 0:
-            print(f"      배치 {bi}/{len(loader)}  ({time.time()-t0:.0f}s)")
-    m = compute_metrics(y_true, y_pred)
+    rows = []
+    for fname, (target, onset) in demo_onset.items():
+        path = os.path.join(_ROOT, fname)
+        if not os.path.isfile(path):
+            rows.append({"file": fname, "target": target, "onset_req": onset,
+                         "onset_det": None, "note": "파일 없음"})
+            continue
 
-    sample = ds[0][0].unsqueeze(0)  # (1, 3, 3, 224, 224)
-    gpu_ms = gpu_tp = None
-    if torch.cuda.is_available():
-        gpu_ms, gpu_tp = measure_latency(model, sample, "cuda", warmup=5, iters=30)
-    cpu_ms, cpu_tp = measure_latency(model, sample, "cpu", warmup=2, iters=10)
+        detector = HumanDetector("yolo11n-pose.pt", conf, imgsz=imgsz)
+        tracker = HumanTracker(30)
+        buf = TrackBehaviorBuffer(kpt_weights)
+        obj_det = theft = None
+        if object_weights and os.path.isfile(object_weights):
+            obj_det = ObjectDetector(object_weights, conf_threshold=0.25, imgsz=imgsz)
+            if 1 in getattr(obj_det, "names", {}):
+                theft = TheftMonitor()
 
-    m.update({"arch": arch, "n_params": n_params, "model_file": weights,
-              "eval_set": csv_name, "epoch": epoch,
-              "gpu_ms": gpu_ms, "gpu_tp": gpu_tp, "cpu_ms": cpu_ms, "cpu_tp": cpu_tp})
-    return m
+        cap = cv2.VideoCapture(path)
+        fi, detected = 0, None
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            dets = detector.detect(frame)
+            tracks = tracker.update(dets, frame)
+            kpt_map = _match_keypoints(tracks, dets)
+            bmap = buf.update(tracks, kpt_map)
+            if theft is not None:
+                objs = obj_det.detect(frame)
+                for tid in theft.update(tracks, kpt_map, objs):
+                    if bmap.get(tid, (-1, 0))[0] in (-1, 0):
+                        bmap[tid] = (6, 0.9)
+            cid, _ = _summarize_behavior(bmap)
+            if detected is None and cid == target:
+                detected = fi
+            fi += 1
+        cap.release()
+        delta = (detected - onset) if detected is not None else None
+        rows.append({"file": fname, "target": target, "onset_req": onset,
+                     "onset_det": detected, "total": fi,
+                     "delta": delta, "note": ""})
+        ds = "미감지" if detected is None else f"{detected}f (Δ{delta:+d})"
+        print(f"  [{fname}] 목표 {LABEL_NAMES[target]}  요청 {onset}f → 감지 {ds}")
+    return rows
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -244,20 +241,21 @@ def main():
           f"({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
     kpt_weights = os.path.join(_HERE, "output", "kpt_behavior.pth")
-    conv_weights = os.path.join(_ROOT, "model", "model_final.pth")
+    object_weights = os.path.join(_ROOT, "model", "objects.pt")
 
+    # 1) 키포인트 행동 분류 지표 (held-out kpt_val.npz)
     res_kpt = evaluate_kpt(kpt_weights, os.path.join(_HERE, "split", "kpt_val.npz"))
-    # test.csv 는 원본 NIA 소스 경로(CP949)라 현재 디스크에 이미지가 없음(0/7366).
-    # 실재하는 유일한 held-out 셋인 val.csv 로 평가한다.
-    res_conv = evaluate_convlstm(conv_weights, "val.csv")
-
     print_summary("KeypointLSTMv2 (kpt_behavior.pth)", res_kpt)
-    print_summary("LSTM_NIA (model_final.pth)", res_conv)
+
+    # 2) 데모 영상 온셋 감지 평가 (앱 추론 경로)
+    from demo_onset import DEMO_ONSET
+    print("\n[2] 데모 영상 온셋 감지 평가")
+    onset_rows = evaluate_onset(kpt_weights, object_weights, DEMO_ONSET)
 
     # docx 생성
     from eval_report import build_report
     out = os.path.join(_ROOT, "AI_성능평가표.docx")
-    build_report(out, res_kpt, res_conv, DEVICE)
+    build_report(out, res_kpt, onset_rows, DEVICE, LABEL_NAMES)
     print(f"\n저장 완료: {out}")
 
 

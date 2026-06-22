@@ -53,7 +53,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-
+# ───────── 추적 예외: 앱 실행에 필요한 모델 (GitHub 배포용) ─────────
+# 위 *.pt / *.pth / train/*/output/* 무시를 덮어써 이 3개만 커밋
 !/yolo11n-pose.pt
 !model/objects.pt
 !train/1_behavior/output/kpt_behavior.pth

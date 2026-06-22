@@ -1,10 +1,10 @@
-"""키포인트 시퀀스 데이터셋 (extract_keypoints.py 출력 .npz 로드)."""
+"""키포인트 시퀀스 데이터셋 (extract_kpts_video.py 출력 .npz 로드)."""
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-LABEL_NAMES = ["정상", "전도", "파손", "방화", "흡연", "유기", "절도", "폭행"]
+from kpt_common import LABEL_NAMES
 
 
 class KptBehaviorDataset(Dataset):

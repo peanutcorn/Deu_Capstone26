@@ -122,3 +122,6 @@ python train_kpt.py
 ## 라이선스
 
 본 프로젝트는 학술 목적으로 제작되었습니다.
+
+## rtsp 계정
+rtsp://capstonetc72deu:officedeuackr26@172.30.1.93:554/stream1

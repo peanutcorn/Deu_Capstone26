@@ -1,15 +1,44 @@
 import os
-import math
 
 import torch
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QSlider,
-    QFileDialog, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox,
+    QFileDialog, QHBoxLayout, QVBoxLayout, QGroupBox,
     QSizePolicy, QStatusBar, QComboBox, QCheckBox, QSpinBox,
-    QMessageBox, QFrame, QLineEdit
+    QMessageBox, QFrame, QLineEdit, QMdiArea, QMdiSubWindow
 )
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtGui import QPixmap, QFont, QBrush, QColor
+
+
+class _SourceSubWindow(QMdiSubWindow):
+    """닫기(X) 시 소스 정리를 트리거하는 MDI 서브창."""
+
+    closed = pyqtSignal(int)   # source_id
+
+    def __init__(self, sid: int):
+        super().__init__()
+        self.sid = sid
+
+    def closeEvent(self, event):
+        # 실제 정리는 MainWindow._remove_source 가 수행
+        self.closed.emit(self.sid)
+        event.ignore()
+
+
+class ClickSeekSlider(QSlider):
+    """클릭한 위치로 즉시 이동하는 슬라이더 (기본 QSlider 는 페이지 단위로만 점프)."""
+
+    clicked_value = pyqtSignal(int)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            ratio = ev.x() / max(1, self.width())
+            val = self.minimum() + round(ratio * (self.maximum() - self.minimum()))
+            self.setValue(int(val))
+            self.clicked_value.emit(int(val))
+            ev.accept()
+        super().mousePressEvent(ev)
 
 from core.video_thread import VideoThread
 
@@ -23,6 +52,16 @@ def _default_kpt_behavior_model_path() -> str:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path = os.path.join(root, "train", "1_behavior", "output", "kpt_behavior.pth")
     return path if os.path.isfile(path) else ""
+
+
+def _default_stand_model_path() -> str:
+    """가판대·결제기 감지 모델 기본 경로 (objects.pt 우선, 구버전 stand.pt 폴백)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("objects.pt", "stand.pt"):
+        path = os.path.join(root, "model", name)
+        if os.path.isfile(path):
+            return path
+    return ""
 
 
 class VideoDisplay(QLabel):
@@ -55,10 +94,14 @@ class VideoTile(QFrame):
     """다중 소스 그리드의 단일 타일 — 제목줄 + 영상 + 상태줄."""
 
     close_requested = pyqtSignal(int)   # source_id
+    seek_requested = pyqtSignal(int, float)   # (source_id, 0.0~1.0)
+    pause_toggled = pyqtSignal(int, bool)     # (source_id, paused)
 
     def __init__(self, source_id: int, title: str):
         super().__init__()
         self.source_id = source_id
+        self._user_seeking = False
+        self._paused = False
         self.setFrameShape(QFrame.StyledPanel)
         self.setStyleSheet(
             "VideoTile { border: 1px solid #2e2e4e; border-radius: 6px; "
@@ -88,6 +131,34 @@ class VideoTile(QFrame):
         )
         layout.addWidget(self.display, stretch=1)
 
+        # 컨트롤 행: [일시정지] [재생바(파일 소스)] [시간]
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(4)
+
+        # 영상별 일시정지/재생 버튼 (전체 제어 대신 소스 단위)
+        self.btn_pause = QPushButton("⏸")
+        self.btn_pause.setFixedSize(28, 22)
+        self.btn_pause.setToolTip("이 영상 일시정지/재생")
+        self.btn_pause.clicked.connect(self._on_pause_clicked)
+
+        self.slider_seek = ClickSeekSlider(Qt.Horizontal)
+        self.slider_seek.setRange(0, 1000)
+        self.slider_seek.setValue(0)
+        self.slider_seek.setVisible(False)
+        self.slider_seek.sliderPressed.connect(self._on_seek_pressed)
+        self.slider_seek.sliderReleased.connect(self._on_seek_released)
+        # 트랙의 임의 위치 클릭 → 즉시 그 지점에서 재생
+        self.slider_seek.clicked_value.connect(self._on_seek_clicked)
+
+        self.lbl_time = QLabel("")
+        self.lbl_time.setStyleSheet("color: #8888aa; font-size: 10px;")
+        self.lbl_time.setVisible(False)
+
+        seek_row.addWidget(self.btn_pause)
+        seek_row.addWidget(self.slider_seek, stretch=1)
+        seek_row.addWidget(self.lbl_time)
+        layout.addLayout(seek_row)
+
         self.lbl_status = QLabel("인원 — | FPS —")
         self.lbl_status.setStyleSheet("color: #8888aa; font-size: 10px;")
         layout.addWidget(self.lbl_status)
@@ -98,6 +169,37 @@ class VideoTile(QFrame):
     def set_finished(self):
         self.lbl_status.setText("재생 완료")
 
+    # ----------------------------------------------------------- 재생바(탐색)
+    def enable_seek(self):
+        """동영상 파일 소스에 대해 재생바를 표시한다."""
+        self.slider_seek.setVisible(True)
+        self.lbl_time.setVisible(True)
+
+    def set_progress(self, cur: int, total: int):
+        """재생 진행률 갱신 — 사용자가 드래그 중일 때는 건드리지 않는다."""
+        if total <= 0 or self._user_seeking:
+            return
+        self.slider_seek.setValue(int(cur / total * 1000))
+        self.lbl_time.setText(f"{cur}/{total}")
+
+    def _on_seek_pressed(self):
+        self._user_seeking = True
+
+    def _on_seek_released(self):
+        self._user_seeking = False
+        frac = self.slider_seek.value() / 1000.0
+        self.seek_requested.emit(self.source_id, frac)
+
+    def _on_seek_clicked(self, value: int):
+        # 트랙 클릭 즉시 해당 위치로 이동
+        self._user_seeking = False
+        self.seek_requested.emit(self.source_id, value / 1000.0)
+
+    def _on_pause_clicked(self):
+        self._paused = not self._paused
+        self.btn_pause.setText("▶" if self._paused else "⏸")
+        self.pause_toggled.emit(self.source_id, self._paused)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -107,12 +209,13 @@ class MainWindow(QMainWindow):
         # source_id → {"thread", "tile", "title", "count", "fps", "behavior"}
         self._sources: dict[int, dict] = {}
         self._next_id = 0
-        self._all_paused = False
         self._build_ui()
         self._apply_stylesheet()
 
     # ------------------------------------------------------------------ UI 구성
     def _build_ui(self):
+        self._build_menubar()
+
         central = QWidget()
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
@@ -126,44 +229,41 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("대기 중 — 파일, 웹캠 또는 IP 카메라를 추가하세요.")
 
+    def _build_menubar(self):
+        menubar = self.menuBar()
+        rec_menu = menubar.addMenu("녹화 기록")
+        act_open = rec_menu.addAction("녹화 기록 보기")
+        act_open.triggered.connect(self._open_recordings)
+
+    def _open_recordings(self):
+        from gui.recordings_dialog import RecordingsDialog
+        dlg = RecordingsDialog(self)
+        dlg.exec_()
+
     def _build_video_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # 다중 소스 그리드
-        self.grid_container = QWidget()
-        self.grid_layout = QGridLayout(self.grid_container)
-        self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        self.grid_layout.setSpacing(6)
+        # 다중 소스 — 자유 이동·크기조절 가능한 MDI 서브창
+        self.mdi = QMdiArea()
+        self.mdi.setBackground(QBrush(QColor("#12121e")))
+        self.mdi.setViewMode(QMdiArea.SubWindowView)
+        self.mdi.setOption(QMdiArea.DontMaximizeSubWindowOnActivation, True)
+        layout.addWidget(self.mdi, stretch=1)
 
-        self.placeholder = QLabel("영상 소스를 추가하세요\n(웹캠 여러 대 동시 연결 가능)")
-        self.placeholder.setAlignment(Qt.AlignCenter)
-        self.placeholder.setFont(QFont("Malgun Gothic", 16))
-        self.placeholder.setStyleSheet(
-            "background-color: #1a1a2e; color: #8888aa; border-radius: 6px;"
-        )
-        self.placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.grid_layout.addWidget(self.placeholder, 0, 0)
-
-        layout.addWidget(self.grid_container, stretch=1)
-
-        # 하단 재생 컨트롤 (전체 소스 일괄 제어)
+        # 창 정렬 보조 버튼 (위치는 자유롭게 조정 가능, 한 번에 정돈용)
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
-        self.btn_play = QPushButton("⏸  전체 일시정지")
-        self.btn_play.setFixedHeight(36)
-        self.btn_play.clicked.connect(self._on_play_pause)
-        self.btn_play.setEnabled(False)
-
-        self.btn_stop = QPushButton("■  전체 정지")
-        self.btn_stop.setFixedHeight(36)
-        self.btn_stop.clicked.connect(self._on_stop_all)
-        self.btn_stop.setEnabled(False)
-
-        ctrl.addWidget(self.btn_play)
-        ctrl.addWidget(self.btn_stop)
+        self.btn_tile = QPushButton("바둑판 정렬")
+        self.btn_tile.setFixedHeight(28)
+        self.btn_tile.clicked.connect(lambda: self.mdi.tileSubWindows())
+        self.btn_cascade = QPushButton("계단식 정렬")
+        self.btn_cascade.setFixedHeight(28)
+        self.btn_cascade.clicked.connect(lambda: self.mdi.cascadeSubWindows())
+        ctrl.addWidget(self.btn_tile)
+        ctrl.addWidget(self.btn_cascade)
         ctrl.addStretch()
         layout.addLayout(ctrl)
         return panel
@@ -325,10 +425,18 @@ class MainWindow(QMainWindow):
         self.chk_keypoints.setChecked(True)
         self.chk_kpt_behavior = QCheckBox("키포인트 행동 분류")
         self.chk_kpt_behavior.setChecked(True)
+        self.chk_stand = QCheckBox("가판대·결제기 감지")
+        # 가판대 모델(model/stand.pt)이 있을 때만 기본 체크/활성
+        _has_stand = bool(_default_stand_model_path())
+        self.chk_stand.setChecked(_has_stand)
+        self.chk_stand.setEnabled(_has_stand)
+        if not _has_stand:
+            self.chk_stand.setToolTip("model/stand.pt 가 없습니다 (가판대 모델 미학습)")
         layout.addWidget(self.chk_bbox)
         layout.addWidget(self.chk_track_id)
         layout.addWidget(self.chk_keypoints)
         layout.addWidget(self.chk_kpt_behavior)
+        layout.addWidget(self.chk_stand)
 
         # 체크박스 → 실행 중인 모든 스레드에 실시간 반영
         # bool 단순 속성 쓰기는 GIL이 원자성을 보장하므로 별도 락 불필요
@@ -340,6 +448,8 @@ class MainWindow(QMainWindow):
             lambda s: self._set_thread_attr('show_keypoints', bool(s)))
         self.chk_kpt_behavior.stateChanged.connect(
             lambda s: self._set_thread_attr('show_kpt_behavior', bool(s)))
+        self.chk_stand.stateChanged.connect(
+            lambda s: self._set_thread_attr('show_stand', bool(s)))
         return grp
 
     def _build_stats_group(self) -> QGroupBox:
@@ -397,21 +507,14 @@ class MainWindow(QMainWindow):
         self._add_source(url, f"IP 카메라: {url.split('@')[-1][:30]}")
 
     # ------------------------------------------------------------------ 재생 제어
-    def _on_play_pause(self):
-        if not self._sources:
+    def _on_pause_toggled(self, sid: int, paused: bool):
+        src = self._sources.get(sid)
+        if not src:
             return
-        self._all_paused = not self._all_paused
-        for src in self._sources.values():
-            if self._all_paused:
-                src["thread"].pause()
-            else:
-                src["thread"].resume()
-        self.btn_play.setText("▶  전체 재생" if self._all_paused else "⏸  전체 일시정지")
-
-    def _on_stop_all(self):
-        for sid in list(self._sources):
-            self._remove_source(sid)
-        self.status_bar.showMessage("전체 정지됨.")
+        if paused:
+            src["thread"].pause()
+        else:
+            src["thread"].resume()
 
     def _on_browse_kpt_behavior(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -451,6 +554,11 @@ class MainWindow(QMainWindow):
             return
         src["behavior"] = (class_id, conf)
         self._update_behavior_label()
+
+    def _on_progress(self, sid: int, cur: int, total: int):
+        src = self._sources.get(sid)
+        if src:
+            src["tile"].set_progress(cur, total)
 
     def _on_error(self, sid: int, msg: str):
         src = self._sources.get(sid)
@@ -534,19 +642,25 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(
                 "이상행동 모델(kpt_behavior.pth) 미지정 — 감지·추적만 동작합니다.")
 
+        # 물품 가판대 모델 경로 (model/stand.pt 존재 시 전달, 표시는 체크박스로 토글)
+        stand_model = _default_stand_model_path()
+
         sid = self._next_id
         self._next_id += 1
 
         thread = VideoThread(source, model, conf, max_age,
                              kpt_model_path=kpt_model, imgsz=imgsz,
-                             detect_interval=interval)
+                             detect_interval=interval, stand_model_path=stand_model,
+                             source_name=title)
         thread.show_bbox = self.chk_bbox.isChecked()
         thread.show_track_id = self.chk_track_id.isChecked()
         thread.show_keypoints = self.chk_keypoints.isChecked()
         thread.show_kpt_behavior = self.chk_kpt_behavior.isChecked()
+        thread.show_stand = self.chk_stand.isChecked()
 
         tile = VideoTile(sid, title)
         tile.close_requested.connect(self._remove_source)
+        tile.pause_toggled.connect(self._on_pause_toggled)
 
         # sid 를 기본 인자로 바인딩해 소스별 콜백 분기
         thread.frame_ready.connect(lambda img, s=sid: self._on_frame(s, img))
@@ -555,23 +669,30 @@ class MainWindow(QMainWindow):
         thread.error_occurred.connect(lambda m, s=sid: self._on_error(s, m))
         thread.finished_signal.connect(lambda s=sid: self._on_thread_finished(s))
 
+        # 동영상 파일 소스만 재생바(탐색) 활성화
+        if thread.is_file:
+            tile.enable_seek()
+            thread.progress_updated.connect(
+                lambda cur, total, s=sid: self._on_progress(s, cur, total))
+            tile.seek_requested.connect(
+                lambda s, frac: self._sources[s]["thread"].seek_to_fraction(frac)
+                if s in self._sources else None)
+
+        # 자유 이동·크기조절 가능한 MDI 서브창에 담는다
+        sub = _SourceSubWindow(sid)
+        sub.setWidget(tile)
+        sub.setWindowTitle(title)
+        sub.closed.connect(self._remove_source)
+        self.mdi.addSubWindow(sub)
+        sub.resize(520, 400)
+        sub.show()
+
         self._sources[sid] = {
-            "thread": thread, "tile": tile, "title": title,
+            "thread": thread, "tile": tile, "subwindow": sub, "title": title,
             "count": 0, "fps": 0.0, "behavior": (-1, 0.0),
         }
 
-        # 새 소스 추가 시 전체 일시정지 상태 해제
-        if self._all_paused:
-            self._all_paused = False
-            for src in self._sources.values():
-                src["thread"].resume()
-
-        self._relayout_grid()
         thread.start()
-
-        self.btn_play.setEnabled(True)
-        self.btn_play.setText("⏸  전체 일시정지")
-        self.btn_stop.setEnabled(True)
         self.status_bar.showMessage(f"{title} 연결됨 — 처리 중...")
         self._update_source_count()
 
@@ -582,49 +703,21 @@ class MainWindow(QMainWindow):
         thread = src["thread"]
         if thread.isRunning():
             thread.stop()
-        src["tile"].setParent(None)
+        sub = src.get("subwindow")
+        if sub is not None:
+            self.mdi.removeSubWindow(sub)
+            sub.deleteLater()
         src["tile"].deleteLater()
 
-        self._relayout_grid()
         self._update_source_count()
         self._update_aggregate_stats()
         self._update_behavior_label()
         if not self._sources:
-            self.btn_play.setEnabled(False)
-            self.btn_stop.setEnabled(False)
-            self.btn_play.setText("⏸  전체 일시정지")
-            self._all_paused = False
             self.lbl_count.setText("감지된 인원: 0명")
             self.lbl_fps.setText("FPS: —")
 
     def _update_source_count(self):
         self.lbl_source.setText(f"연결된 소스: {len(self._sources)} / {MAX_SOURCES}")
-
-    def _relayout_grid(self):
-        """타일 수에 맞춰 그리드 재배치 — 1개: 1열, ≤4개: 2열, 그 외: 3열."""
-        # 기존 위젯 전부 제거 (삭제 아님)
-        while self.grid_layout.count():
-            item = self.grid_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-
-        tiles = [s["tile"] for s in self._sources.values()]
-        if not tiles:
-            self.grid_layout.addWidget(self.placeholder, 0, 0)
-            self.placeholder.show()
-            return
-
-        self.placeholder.hide()
-        n = len(tiles)
-        cols = 1 if n == 1 else (2 if n <= 4 else 3)
-        rows = math.ceil(n / cols)
-        for i, tile in enumerate(tiles):
-            self.grid_layout.addWidget(tile, i // cols, i % cols)
-        for r in range(rows):
-            self.grid_layout.setRowStretch(r, 1)
-        for c in range(cols):
-            self.grid_layout.setColumnStretch(c, 1)
 
     def closeEvent(self, event):
         for sid in list(self._sources):
@@ -709,4 +802,14 @@ class MainWindow(QMainWindow):
             QLineEdit:focus { border-color: #00d4aa; }
             QStatusBar { background-color: #0e0e1e; color: #8888aa; }
             QLabel { color: #c0c0e0; }
+            QMenuBar { background-color: #0e0e1e; color: #c0c0e0; }
+            QMenuBar::item { padding: 4px 12px; background: transparent; }
+            QMenuBar::item:selected { background: #2a2a4a; border-radius: 4px; }
+            QMenu { background-color: #1e1e3e; color: #e0e0f0;
+                    border: 1px solid #3a3a6a; }
+            QMenu::item:selected { background-color: #2a2a4a; }
+            QTableWidget { background-color: #1a1a2e; color: #e0e0f0;
+                           gridline-color: #2e2e4e; }
+            QHeaderView::section { background-color: #2a2a4a; color: #e0e0f0;
+                                   border: none; padding: 4px; }
         """)

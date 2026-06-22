@@ -144,6 +144,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument("--dropout", type=float, default=DROPOUT)
+    parser.add_argument("--no-deploy", action="store_true",
+                        help="kpt_behavior.pth 로 배포하지 않음 (실험용)")
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
 
@@ -170,8 +175,8 @@ def main():
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-    model = KeypointLSTMv2(hidden=HIDDEN, num_layers=NUM_LAYERS,
-                           num_classes=len(LABEL_NAMES), dropout=DROPOUT)
+    model = KeypointLSTMv2(hidden=args.hidden, num_layers=NUM_LAYERS,
+                           num_classes=len(LABEL_NAMES), dropout=args.dropout)
     if len(GPUS) > 1:
         model = nn.DataParallel(model, device_ids=GPUS)
     model = model.to(device)
@@ -180,7 +185,8 @@ def main():
     # label_smoothing: 영상 전체에 단일 라벨을 부여한 약지도 노이즈 완화
     criterion = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, args.epochs, eta_min=LR_MIN
     )
@@ -219,6 +225,11 @@ def main():
 
     # 앱이 기본으로 찾는 이름(kpt_behavior.pth)에는 **best 체크포인트**를 배포한다.
     # 마지막 에포크가 과적합으로 best 보다 나쁠 수 있으므로 best 를 우선한다.
+    if args.no_deploy:
+        logger.info(f"실험 모드(--no-deploy): 최고 val acc {best_acc*100:.2f}% "
+                    f"(배포 생략, kpt_best.pth 만 저장)")
+        return
+
     final_path = os.path.join(args.output_dir, "kpt_behavior.pth")
     best_path = os.path.join(args.output_dir, "kpt_best.pth")
     raw = model.module if isinstance(model, nn.DataParallel) else model
